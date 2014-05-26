@@ -124,6 +124,89 @@ func TestRPC(t *testing.T) {
 	testNewServerRPC(t, newServerAddr)
 }
 
+type Sleepy struct {
+	started   uint
+	completed uint
+}
+
+func (s *Sleepy) DoSomething(args int, reply *struct{}) error {
+	defer func() {
+		s.completed++
+	}()
+	s.started++
+	time.Sleep(200 * time.Millisecond)
+	return nil
+}
+
+func TestGracefulStop(t *testing.T) {
+	sleepy := new(Sleepy)
+
+	localServer := NewServer()
+	localServer.Register(sleepy)
+
+	l, serverAddr := listenTCP()
+	log.Println("Test RPC server listening on", serverAddr)
+
+	stop := make(chan struct{})
+	cancel := make(chan struct{})
+	var wg sync.WaitGroup
+
+	go func() {
+		select {
+		case <-stop:
+			l.Close()
+			return
+		case <-cancel:
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				close(cancel)
+
+				select {
+				case <-stop:
+					// Ignore errors if the listener has been closed.
+					wg.Done()
+				default:
+					t.Errorf("Can't accept new connection: %s", err)
+				}
+				return
+			}
+
+			wg.Add(1)
+			go func(conn net.Conn) {
+				defer wg.Done()
+				localServer.ServeConn(conn, stop)
+			}(conn)
+		}
+	}()
+
+	client, err := Dial("tcp", serverAddr)
+	if err != nil {
+		t.Fatal("dialing", err)
+	}
+	defer client.Close()
+
+	var reply struct{}
+	go func() {
+		err = client.Call("Sleepy.DoSomething", 42, &reply)
+		if err != nil {
+			t.Errorf("DoSomething: expected no error but got string %q", err.Error())
+		}
+	}()
+
+	close(stop)
+	wg.Wait()
+
+	if sleepy.started != sleepy.completed {
+		t.Errorf("Graceful stop issue: a number of started calls isn't equal to a number of completed calls. Started calls: %d, completed calls: %d.", sleepy.started, sleepy.completed)
+	}
+}
+
 func testRPC(t *testing.T, addr string) {
 	client, err := Dial("tcp", addr)
 	if err != nil {

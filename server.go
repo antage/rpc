@@ -372,7 +372,12 @@ func (m *methodType) NumCalls() (n uint) {
 	return n
 }
 
-func (s *service) call(server *Server, sending *sync.Mutex, mtype *methodType, req *Request, argv, replyv reflect.Value, codec ServerCodec) {
+func (s *service) call(server *Server, sending *sync.Mutex, mtype *methodType, req *Request, argv, replyv reflect.Value, codec ServerCodec, wg *sync.WaitGroup) {
+	defer func() {
+		if wg != nil {
+			wg.Done()
+		}
+	}()
 	mtype.Lock()
 	mtype.numCalls++
 	mtype.Unlock()
@@ -423,17 +428,28 @@ func (c *gobServerCodec) Close() error {
 // The caller typically invokes ServeConn in a go statement.
 // ServeConn uses the gob wire format (see package gob) on the
 // connection.  To use an alternate codec, use ServeCodec.
-func (server *Server) ServeConn(conn io.ReadWriteCloser) {
+// ServeConn will close the connection gracefully if the caller closes stop channel.
+func (server *Server) ServeConn(conn io.ReadWriteCloser, stop <-chan struct{}) {
 	buf := bufio.NewWriter(conn)
 	srv := &gobServerCodec{conn, gob.NewDecoder(conn), gob.NewEncoder(buf), buf}
-	server.ServeCodec(srv)
+	server.ServeCodec(srv, stop)
 }
 
 // ServeCodec is like ServeConn but uses the specified codec to
-// decode requests and encode responses.
-func (server *Server) ServeCodec(codec ServerCodec) {
+// decode requests and encode responses. When stop channel is closed
+// ServeCodec will stop to read requests, wait all active goroutines are completed,
+// close the codec and exit if stop channel has been closed.
+func (server *Server) ServeCodec(codec ServerCodec, stop <-chan struct{}) {
+	var wg sync.WaitGroup
 	sending := new(sync.Mutex)
+loop:
 	for {
+		select {
+		case <-stop:
+			break loop
+		default:
+		}
+
 		service, mtype, req, argv, replyv, keepReading, err := server.readRequest(codec)
 		if err != nil {
 			if debugLog && err != io.EOF {
@@ -449,8 +465,10 @@ func (server *Server) ServeCodec(codec ServerCodec) {
 			}
 			continue
 		}
-		go service.call(server, sending, mtype, req, argv, replyv, codec)
+		wg.Add(1)
+		go service.call(server, sending, mtype, req, argv, replyv, codec, &wg)
 	}
+	wg.Wait()
 	codec.Close()
 }
 
@@ -470,7 +488,7 @@ func (server *Server) ServeRequest(codec ServerCodec) error {
 		}
 		return err
 	}
-	service.call(server, sending, mtype, req, argv, replyv, codec)
+	service.call(server, sending, mtype, req, argv, replyv, codec, nil)
 	return nil
 }
 
@@ -594,7 +612,7 @@ func (server *Server) Accept(lis net.Listener) {
 		if err != nil {
 			log.Fatal("rpc.Serve: accept:", err.Error()) // TODO(r): exit?
 		}
-		go server.ServeConn(conn)
+		go server.ServeConn(conn, nil)
 	}
 }
 
@@ -628,14 +646,17 @@ type ServerCodec interface {
 // The caller typically invokes ServeConn in a go statement.
 // ServeConn uses the gob wire format (see package gob) on the
 // connection.  To use an alternate codec, use ServeCodec.
-func ServeConn(conn io.ReadWriteCloser) {
-	DefaultServer.ServeConn(conn)
+// ServeConn will close the connection gracefully if the caller closes stop channel.
+func ServeConn(conn io.ReadWriteCloser, stop <-chan struct{}) {
+	DefaultServer.ServeConn(conn, stop)
 }
 
 // ServeCodec is like ServeConn but uses the specified codec to
 // decode requests and encode responses.
-func ServeCodec(codec ServerCodec) {
-	DefaultServer.ServeCodec(codec)
+// ServeCodec will stop to read requests, wait all active goroutines are completed,
+// close the codec and exit if stop channel has been closed.
+func ServeCodec(codec ServerCodec, stop <-chan struct{}) {
+	DefaultServer.ServeCodec(codec, stop)
 }
 
 // ServeRequest is like ServeCodec but synchronously serves a single request.
@@ -666,7 +687,7 @@ func (server *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	io.WriteString(conn, "HTTP/1.0 "+connected+"\n\n")
-	server.ServeConn(conn)
+	server.ServeConn(conn, nil)
 }
 
 // HandleHTTP registers an HTTP handler for RPC messages on rpcPath,
