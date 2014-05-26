@@ -47,6 +47,11 @@ func (t *Arith) Add(args Args, reply *Reply) error {
 	return nil
 }
 
+func (t *Arith) AddWithContext(context int, args Args, reply *Reply) error {
+	reply.C = args.A + args.B + context
+	return nil
+}
+
 func (t *Arith) Mul(args *Args, reply *Reply) error {
 	reply.C = args.A * args.B
 	return nil
@@ -180,7 +185,7 @@ func TestGracefulStop(t *testing.T) {
 			wg.Add(1)
 			go func(conn net.Conn) {
 				defer wg.Done()
-				localServer.ServeConn(conn, stop)
+				localServer.ServeConn(conn, nil, stop)
 			}(conn)
 		}
 	}()
@@ -402,9 +407,26 @@ func (codec *CodecEmulator) Call(serviceMethod string, args *Args, reply *Reply)
 	codec.err = nil
 	var serverError error
 	if codec.server == nil {
-		serverError = ServeRequest(codec)
+		serverError = ServeRequest(codec, nil)
 	} else {
-		serverError = codec.server.ServeRequest(codec)
+		serverError = codec.server.ServeRequest(codec, nil)
+	}
+	if codec.err == nil && serverError != nil {
+		codec.err = serverError
+	}
+	return codec.err
+}
+
+func (codec *CodecEmulator) CallWithContext(serviceMethod string, args *Args, reply *Reply, context interface{}) error {
+	codec.serviceMethod = serviceMethod
+	codec.args = args
+	codec.reply = reply
+	codec.err = nil
+	var serverError error
+	if codec.server == nil {
+		serverError = ServeRequest(codec, context)
+	} else {
+		serverError = codec.server.ServeRequest(codec, context)
 	}
 	if codec.err == nil && serverError != nil {
 		codec.err = serverError
@@ -444,6 +466,7 @@ func TestServeRequest(t *testing.T) {
 	testServeRequest(t, nil)
 	newOnce.Do(startNewServer)
 	testServeRequest(t, newServer)
+	testServeRequestWithContext(t, newServer)
 }
 
 func testServeRequest(t *testing.T, server *Server) {
@@ -463,6 +486,26 @@ func testServeRequest(t *testing.T, server *Server) {
 	err = client.Call("Arith.Add", nil, reply)
 	if err == nil {
 		t.Errorf("expected error calling Arith.Add with nil arg")
+	}
+}
+
+func testServeRequestWithContext(t *testing.T, server *Server) {
+	client := CodecEmulator{server: server}
+	defer client.Close()
+
+	args := &Args{7, 8}
+	reply := new(Reply)
+	err := client.CallWithContext("Arith.AddWithContext", args, reply, 5)
+	if err != nil {
+		t.Errorf("AddWithContext: expected no error but got string %q", err.Error())
+	}
+	if reply.C != args.A+args.B+5 {
+		t.Errorf("AddWithContext: expected %d got %d", reply.C, args.A+args.B+5)
+	}
+
+	err = client.CallWithContext("Arith.AddWithContext", nil, reply, 5)
+	if err == nil {
+		t.Errorf("expected error calling Arith.AddWithContext with nil arg")
 	}
 }
 

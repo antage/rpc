@@ -14,13 +14,17 @@
 	other methods will be ignored:
 
 		- the method is exported.
-		- the method has two arguments, both exported (or builtin) types.
+		- the method has two or three arguments, all exported (or builtin) types.
 		- the method's second argument is a pointer.
 		- the method has return type error.
 
 	In effect, the method must look schematically like
 
 		func (t *T) MethodName(argType T1, replyType *T2) error
+
+	or
+
+		func (t *T) MethodName(contextType T3, argType T1, replyType *T2) error
 
 	where T, T1 and T2 can be marshaled by encoding/gob.
 	These requirements apply even if a different codec is used.
@@ -30,7 +34,8 @@
 	second argument represents the result parameters to be returned to the caller.
 	The method's return value, if non-nil, is passed back as a string that the client
 	sees as if created by errors.New.  If an error is returned, the reply parameter
-	will not be sent back to the client.
+	will not be sent back to the client. The method may have optional context value
+	at first argument.
 
 	The server may handle requests on a single connection by calling ServeConn.  More
 	typically it will create a network listener and call Accept or, for an HTTP
@@ -147,11 +152,12 @@ const (
 var typeOfError = reflect.TypeOf((*error)(nil)).Elem()
 
 type methodType struct {
-	sync.Mutex // protects counters
-	method     reflect.Method
-	ArgType    reflect.Type
-	ReplyType  reflect.Type
-	numCalls   uint
+	sync.Mutex  // protects counters
+	method      reflect.Method
+	ContextType reflect.Type
+	ArgType     reflect.Type
+	ReplyType   reflect.Type
+	numCalls    uint
 }
 
 type service struct {
@@ -284,7 +290,10 @@ func (server *Server) register(rcvr interface{}, name string, useName bool) erro
 // suitableMethods returns suitable Rpc methods of typ, it will report
 // error using log if reportErr is true.
 func suitableMethods(typ reflect.Type, reportErr bool) map[string]*methodType {
+	var contextType, argType, replyType reflect.Type
+
 	methods := make(map[string]*methodType)
+nextMethod:
 	for m := 0; m < typ.NumMethod(); m++ {
 		method := typ.Method(m)
 		mtype := method.Type
@@ -293,23 +302,34 @@ func suitableMethods(typ reflect.Type, reportErr bool) map[string]*methodType {
 		if method.PkgPath != "" {
 			continue
 		}
-		// Method needs three ins: receiver, *args, *reply.
-		if mtype.NumIn() != 3 {
+
+		switch mtype.NumIn() {
+		case 3:
+			// Method needs three ins: receiver, *args, *reply.
+			contextType = nil
+			argType = mtype.In(1)
+			replyType = mtype.In(2)
+		case 4:
+			// Method needs four ins: context, receiver, *args, *reply.
+			contextType = mtype.In(1)
+			argType = mtype.In(2)
+			replyType = mtype.In(3)
+		default:
 			if reportErr {
 				log.Println("method", mname, "has wrong number of ins:", mtype.NumIn())
 			}
-			continue
+			continue nextMethod
 		}
-		// First arg need not be a pointer.
-		argType := mtype.In(1)
+
+		// Args must be exported.
 		if !isExportedOrBuiltinType(argType) {
 			if reportErr {
 				log.Println(mname, "argument type not exported:", argType)
 			}
 			continue
 		}
-		// Second arg must be a pointer.
-		replyType := mtype.In(2)
+
+		// Reply type must be a pointer.
 		if replyType.Kind() != reflect.Ptr {
 			if reportErr {
 				log.Println("method", mname, "reply type not a pointer:", replyType)
@@ -323,6 +343,7 @@ func suitableMethods(typ reflect.Type, reportErr bool) map[string]*methodType {
 			}
 			continue
 		}
+
 		// Method needs one out.
 		if mtype.NumOut() != 1 {
 			if reportErr {
@@ -337,7 +358,7 @@ func suitableMethods(typ reflect.Type, reportErr bool) map[string]*methodType {
 			}
 			continue
 		}
-		methods[mname] = &methodType{method: method, ArgType: argType, ReplyType: replyType}
+		methods[mname] = &methodType{method: method, ContextType: contextType, ArgType: argType, ReplyType: replyType}
 	}
 	return methods
 }
@@ -372,7 +393,7 @@ func (m *methodType) NumCalls() (n uint) {
 	return n
 }
 
-func (s *service) call(server *Server, sending *sync.Mutex, mtype *methodType, req *Request, argv, replyv reflect.Value, codec ServerCodec, wg *sync.WaitGroup) {
+func (s *service) call(server *Server, sending *sync.Mutex, mtype *methodType, req *Request, contextv, argv, replyv reflect.Value, codec ServerCodec, wg *sync.WaitGroup) {
 	defer func() {
 		if wg != nil {
 			wg.Done()
@@ -383,7 +404,12 @@ func (s *service) call(server *Server, sending *sync.Mutex, mtype *methodType, r
 	mtype.Unlock()
 	function := mtype.method.Func
 	// Invoke the method, providing a new value for the reply.
-	returnValues := function.Call([]reflect.Value{s.rcvr, argv, replyv})
+	var returnValues []reflect.Value
+	if mtype.ContextType != nil {
+		returnValues = function.Call([]reflect.Value{s.rcvr, contextv, argv, replyv})
+	} else {
+		returnValues = function.Call([]reflect.Value{s.rcvr, argv, replyv})
+	}
 	// The return value for the method is an error.
 	errInter := returnValues[0].Interface()
 	errmsg := ""
@@ -429,19 +455,24 @@ func (c *gobServerCodec) Close() error {
 // ServeConn uses the gob wire format (see package gob) on the
 // connection.  To use an alternate codec, use ServeCodec.
 // ServeConn will close the connection gracefully if the caller closes stop channel.
-func (server *Server) ServeConn(conn io.ReadWriteCloser, stop <-chan struct{}) {
+func (server *Server) ServeConn(conn io.ReadWriteCloser, context interface{}, stop <-chan struct{}) {
 	buf := bufio.NewWriter(conn)
 	srv := &gobServerCodec{conn, gob.NewDecoder(conn), gob.NewEncoder(buf), buf}
-	server.ServeCodec(srv, stop)
+	server.ServeCodec(srv, context, stop)
 }
 
 // ServeCodec is like ServeConn but uses the specified codec to
 // decode requests and encode responses. When stop channel is closed
 // ServeCodec will stop to read requests, wait all active goroutines are completed,
 // close the codec and exit if stop channel has been closed.
-func (server *Server) ServeCodec(codec ServerCodec, stop <-chan struct{}) {
+func (server *Server) ServeCodec(codec ServerCodec, context interface{}, stop <-chan struct{}) {
 	var wg sync.WaitGroup
 	sending := new(sync.Mutex)
+
+	var contextv reflect.Value
+	if context != nil {
+		contextv = reflect.ValueOf(context)
+	}
 loop:
 	for {
 		select {
@@ -466,7 +497,7 @@ loop:
 			continue
 		}
 		wg.Add(1)
-		go service.call(server, sending, mtype, req, argv, replyv, codec, &wg)
+		go service.call(server, sending, mtype, req, contextv, argv, replyv, codec, &wg)
 	}
 	wg.Wait()
 	codec.Close()
@@ -474,7 +505,7 @@ loop:
 
 // ServeRequest is like ServeCodec but synchronously serves a single request.
 // It does not close the codec upon completion.
-func (server *Server) ServeRequest(codec ServerCodec) error {
+func (server *Server) ServeRequest(codec ServerCodec, context interface{}) error {
 	sending := new(sync.Mutex)
 	service, mtype, req, argv, replyv, keepReading, err := server.readRequest(codec)
 	if err != nil {
@@ -488,7 +519,11 @@ func (server *Server) ServeRequest(codec ServerCodec) error {
 		}
 		return err
 	}
-	service.call(server, sending, mtype, req, argv, replyv, codec, nil)
+	var contextv reflect.Value
+	if context != nil {
+		contextv = reflect.ValueOf(context)
+	}
+	service.call(server, sending, mtype, req, contextv, argv, replyv, codec, nil)
 	return nil
 }
 
@@ -612,7 +647,7 @@ func (server *Server) Accept(lis net.Listener) {
 		if err != nil {
 			log.Fatal("rpc.Serve: accept:", err.Error()) // TODO(r): exit?
 		}
-		go server.ServeConn(conn, nil)
+		go server.ServeConn(conn, nil, nil)
 	}
 }
 
@@ -647,22 +682,22 @@ type ServerCodec interface {
 // ServeConn uses the gob wire format (see package gob) on the
 // connection.  To use an alternate codec, use ServeCodec.
 // ServeConn will close the connection gracefully if the caller closes stop channel.
-func ServeConn(conn io.ReadWriteCloser, stop <-chan struct{}) {
-	DefaultServer.ServeConn(conn, stop)
+func ServeConn(conn io.ReadWriteCloser, context interface{}, stop <-chan struct{}) {
+	DefaultServer.ServeConn(conn, context, stop)
 }
 
 // ServeCodec is like ServeConn but uses the specified codec to
 // decode requests and encode responses.
 // ServeCodec will stop to read requests, wait all active goroutines are completed,
 // close the codec and exit if stop channel has been closed.
-func ServeCodec(codec ServerCodec, stop <-chan struct{}) {
-	DefaultServer.ServeCodec(codec, stop)
+func ServeCodec(codec ServerCodec, context interface{}, stop <-chan struct{}) {
+	DefaultServer.ServeCodec(codec, context, stop)
 }
 
 // ServeRequest is like ServeCodec but synchronously serves a single request.
 // It does not close the codec upon completion.
-func ServeRequest(codec ServerCodec) error {
-	return DefaultServer.ServeRequest(codec)
+func ServeRequest(codec ServerCodec, context interface{}) error {
+	return DefaultServer.ServeRequest(codec, context)
 }
 
 // Accept accepts connections on the listener and serves requests
@@ -687,7 +722,7 @@ func (server *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	io.WriteString(conn, "HTTP/1.0 "+connected+"\n\n")
-	server.ServeConn(conn, nil)
+	server.ServeConn(conn, nil, nil)
 }
 
 // HandleHTTP registers an HTTP handler for RPC messages on rpcPath,
